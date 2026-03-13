@@ -1,0 +1,797 @@
+# tools/image_webp_optimizer_gui.py
+
+from __future__ import annotations
+
+import csv
+import queue
+import threading
+import traceback
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterable
+
+import tkinter as tk
+from tkinter import filedialog, messagebox, ttk
+
+from PIL import Image, ImageOps
+
+
+APP_TITLE = "Image WebP Optimizer"
+OUTPUT_ROOT_NAME = "otimizacao-imgs-webp"
+
+SUPPORTED_EXTENSIONS = {
+    ".jpg",
+    ".jpeg",
+    ".png",
+    ".webp",
+    ".bmp",
+    ".tif",
+    ".tiff",
+    ".gif",
+    ".avif",
+    ".heic",
+    ".heif",
+}
+
+PRESETS = {
+    "thumbnail": {"width": 200, "quality": 78},
+    "card": {"width": 400, "quality": 82},
+    "detail": {"width": 800, "quality": 85},
+    "hero": {"width": 1200, "quality": 86},
+}
+
+
+@dataclass
+class ConversionResult:
+    status: str
+    source_file: str
+    output_file: str
+    preset: str
+    original_size: int
+    converted_size: int
+    message: str
+
+
+def format_bytes(size: int) -> str:
+    value = float(size)
+    for unit in ["B", "KB", "MB", "GB"]:
+        if value < 1024 or unit == "GB":
+            if unit == "B":
+                return f"{int(value)} {unit}"
+            return f"{value:.1f} {unit}"
+        value /= 1024
+    return f"{value:.1f} GB"
+
+
+def iter_image_files(folder: Path) -> Iterable[Path]:
+    for path in folder.rglob("*"):
+        if path.is_file() and path.suffix.lower() in SUPPORTED_EXTENSIONS:
+            yield path
+
+
+def ensure_parent_dir(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+
+def sanitize_folder_name(name: str) -> str:
+    cleaned = "".join(ch for ch in name if ch not in '<>:"/\\|?*').strip()
+    return cleaned or "folder"
+
+
+def fix_orientation(image: Image.Image) -> Image.Image:
+    return ImageOps.exif_transpose(image)
+
+
+def resize_keep_ratio(image: Image.Image, max_width: int) -> Image.Image:
+    if image.width <= max_width:
+        return image
+
+    new_height = int(image.height * (max_width / image.width))
+    return image.resize((max_width, new_height), Image.Resampling.LANCZOS)
+
+
+def convert_mode_for_webp(image: Image.Image) -> Image.Image:
+    if image.mode in ("RGBA", "LA"):
+        return image
+
+    if image.mode == "P":
+        return image.convert("RGBA")
+
+    if image.mode not in ("RGB", "RGBA"):
+        return image.convert("RGB")
+
+    return image
+
+# tools/image_webp_optimizer_gui.py
+def sanitize_file_stem(name: str) -> str:
+    cleaned = "".join(ch for ch in name if ch not in '<>:"/\\|?*').strip()
+    return cleaned or "image"
+
+
+def build_output_path(
+    source_root: Path,
+    source_file: Path,
+    output_root: Path,
+    source_folder_name: str,
+    preset_name: str,
+) -> Path:
+    relative_path = source_file.relative_to(source_root)
+    safe_stem = sanitize_file_stem(relative_path.stem)
+    new_filename = f"{safe_stem}_{preset_name}.webp"
+    return output_root / source_folder_name / preset_name / relative_path.parent / new_filename
+
+def save_report_csv(output_root: Path, rows: list[ConversionResult]) -> Path:
+    report_path = output_root / "conversion_report.csv"
+    ensure_parent_dir(report_path)
+
+    with report_path.open("w", newline="", encoding="utf-8") as csvfile:
+        writer = csv.writer(csvfile)
+        writer.writerow(
+            [
+                "status",
+                "source_file",
+                "output_file",
+                "preset",
+                "original_size_bytes",
+                "converted_size_bytes",
+                "message",
+            ]
+        )
+
+        for row in rows:
+            writer.writerow(
+                [
+                    row.status,
+                    row.source_file,
+                    row.output_file,
+                    row.preset,
+                    row.original_size,
+                    row.converted_size,
+                    row.message,
+                ]
+            )
+
+    return report_path
+
+
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent: tk.Misc, *args, **kwargs) -> None:
+        super().__init__(parent, *args, **kwargs)
+
+        self.canvas = tk.Canvas(self, highlightthickness=0)
+        self.scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+
+        self.inner = ttk.Frame(self.canvas)
+        self.inner.bind("<Configure>", self._on_inner_configure)
+
+        self.window_id = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.scrollbar.set)
+
+        self.canvas.grid(row=0, column=0, sticky="nsew")
+        self.scrollbar.grid(row=0, column=1, sticky="ns")
+
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+
+        self.canvas.bind("<Configure>", self._on_canvas_configure)
+
+        self._bind_mousewheel(self.canvas)
+        self._bind_mousewheel(self.inner)
+
+    def _on_inner_configure(self, _event=None) -> None:
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_configure(self, event: tk.Event) -> None:
+        self.canvas.itemconfigure(self.window_id, width=event.width)
+
+    def _on_mousewheel(self, event: tk.Event) -> None:
+        if getattr(event, "delta", 0):
+            self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+        elif getattr(event, "num", None) == 4:
+            self.canvas.yview_scroll(-1, "units")
+        elif getattr(event, "num", None) == 5:
+            self.canvas.yview_scroll(1, "units")
+
+    def _bind_mousewheel(self, widget: tk.Misc) -> None:
+        widget.bind("<MouseWheel>", self._on_mousewheel)
+        widget.bind("<Button-4>", self._on_mousewheel)
+        widget.bind("<Button-5>", self._on_mousewheel)
+
+
+class ImageConverterApp:
+    def __init__(self, root: tk.Tk) -> None:
+        self.root = root
+        self.root.title(APP_TITLE)
+        self.root.geometry("1360x860")
+        self.root.minsize(1100, 720)
+
+        self.selected_folders: list[Path] = []
+        self.worker_thread: threading.Thread | None = None
+        self.ui_queue: queue.Queue = queue.Queue()
+        self.results: list[ConversionResult] = []
+
+        self.generate_all_presets_var = tk.BooleanVar(value=True)
+        self.selected_preset_var = tk.StringVar(value="card")
+        self.skip_if_larger_var = tk.BooleanVar(value=True)
+        self.keep_existing_var = tk.BooleanVar(value=False)
+        self.method_var = tk.IntVar(value=6)
+
+        self.success_count_var = tk.StringVar(value="0")
+        self.failed_count_var = tk.StringVar(value="0")
+        self.skipped_count_var = tk.StringVar(value="0")
+        self.processed_count_var = tk.StringVar(value="0")
+        self.total_before_var = tk.StringVar(value="0 B")
+        self.total_after_var = tk.StringVar(value="0 B")
+        self.output_path_var = tk.StringVar(value=str(self.get_output_root()))
+
+        self._build_ui()
+        self._poll_queue()
+
+    def get_output_root(self) -> Path:
+        return Path.cwd() / OUTPUT_ROOT_NAME
+
+    def _build_ui(self) -> None:
+        self.root.configure(bg="#f4f4f4")
+
+        main_frame = ttk.Frame(self.root, padding=12)
+        main_frame.pack(fill="both", expand=True)
+
+        header_frame = ttk.Frame(main_frame)
+        header_frame.pack(fill="x", pady=(0, 10))
+
+        title_label = ttk.Label(
+            header_frame,
+            text="Conversor de imagens para WebP",
+            font=("Segoe UI", 18, "bold"),
+        )
+        title_label.pack(anchor="w")
+
+        subtitle_label = ttk.Label(
+            header_frame,
+            text="Selecione uma ou mais pastas. O sistema converte tudo recursivamente e salva em otimizacao-imgs-webp.",
+            font=("Segoe UI", 10),
+        )
+        subtitle_label.pack(anchor="w", pady=(2, 0))
+
+        content_frame = ttk.Frame(main_frame)
+        content_frame.pack(fill="both", expand=True)
+
+        content_frame.grid_rowconfigure(0, weight=1)
+        content_frame.grid_columnconfigure(0, weight=0)
+        content_frame.grid_columnconfigure(1, weight=1)
+
+        left_wrapper = ttk.Frame(content_frame, width=360)
+        left_wrapper.grid(row=0, column=0, sticky="nsw", padx=(0, 12))
+        left_wrapper.grid_propagate(False)
+        left_wrapper.grid_rowconfigure(0, weight=1)
+        left_wrapper.grid_columnconfigure(0, weight=1)
+
+        self.left_scrollable = ScrollableFrame(left_wrapper)
+        self.left_scrollable.grid(row=0, column=0, sticky="nsew")
+
+        left_frame = self.left_scrollable.inner
+
+        right_frame = ttk.Frame(content_frame)
+        right_frame.grid(row=0, column=1, sticky="nsew")
+        right_frame.grid_rowconfigure(0, weight=0)
+        right_frame.grid_rowconfigure(1, weight=1)
+        right_frame.grid_rowconfigure(2, weight=1)
+        right_frame.grid_columnconfigure(0, weight=1)
+
+        folders_box = ttk.LabelFrame(left_frame, text="Pastas selecionadas", padding=10)
+        folders_box.pack(fill="both", expand=False)
+
+        self.folder_listbox = tk.Listbox(
+            folders_box,
+            width=42,
+            height=16,
+            selectmode=tk.EXTENDED,
+            font=("Consolas", 10),
+        )
+        self.folder_listbox.pack(fill="both", expand=True)
+
+        folder_buttons = ttk.Frame(folders_box)
+        folder_buttons.pack(fill="x", pady=(10, 0))
+
+        ttk.Button(folder_buttons, text="Adicionar pasta", command=self.add_folder).pack(fill="x", pady=2)
+        ttk.Button(folder_buttons, text="Adicionar várias", command=self.add_multiple_folders).pack(fill="x", pady=2)
+        ttk.Button(folder_buttons, text="Remover selecionadas", command=self.remove_selected_folders).pack(fill="x", pady=2)
+        ttk.Button(folder_buttons, text="Limpar lista", command=self.clear_folders).pack(fill="x", pady=2)
+
+        options_box = ttk.LabelFrame(left_frame, text="Configurações", padding=10)
+        options_box.pack(fill="x", pady=(12, 0))
+
+        ttk.Checkbutton(
+            options_box,
+            text="Gerar todos os presets (thumbnail, card, detail, hero)",
+            variable=self.generate_all_presets_var,
+            command=self.toggle_preset_mode,
+        ).pack(anchor="w", pady=2)
+
+        preset_row = ttk.Frame(options_box)
+        preset_row.pack(fill="x", pady=(8, 4))
+        ttk.Label(preset_row, text="Preset único:").pack(side="left")
+
+        self.preset_combo = ttk.Combobox(
+            preset_row,
+            textvariable=self.selected_preset_var,
+            state="readonly",
+            values=list(PRESETS.keys()),
+            width=14,
+        )
+        self.preset_combo.pack(side="left", padx=(8, 0))
+
+        method_row = ttk.Frame(options_box)
+        method_row.pack(fill="x", pady=4)
+        ttk.Label(method_row, text="Compressão WebP (0-6):").pack(side="left")
+        method_spin = ttk.Spinbox(
+            method_row,
+            from_=0,
+            to=6,
+            textvariable=self.method_var,
+            width=6,
+        )
+        method_spin.pack(side="left", padx=(8, 0))
+
+        ttk.Checkbutton(
+            options_box,
+            text="Pular arquivo se o WebP ficar maior que o original",
+            variable=self.skip_if_larger_var,
+        ).pack(anchor="w", pady=2)
+
+        ttk.Checkbutton(
+            options_box,
+            text="Manter arquivo convertido já existente",
+            variable=self.keep_existing_var,
+        ).pack(anchor="w", pady=2)
+
+        output_box = ttk.LabelFrame(left_frame, text="Destino", padding=10)
+        output_box.pack(fill="x", pady=(12, 0))
+
+        output_entry = ttk.Entry(output_box, textvariable=self.output_path_var, state="readonly")
+        output_entry.pack(fill="x")
+
+        action_box = ttk.LabelFrame(left_frame, text="Execução", padding=10)
+        action_box.pack(fill="x", pady=(12, 12))
+
+        self.start_button = ttk.Button(action_box, text="Iniciar conversão", command=self.start_conversion)
+        self.start_button.pack(fill="x", pady=2)
+
+        self.open_output_button = ttk.Button(action_box, text="Abrir pasta de saída", command=self.open_output_folder)
+        self.open_output_button.pack(fill="x", pady=2)
+
+        self.progress = ttk.Progressbar(action_box, mode="determinate")
+        self.progress.pack(fill="x", pady=(10, 0))
+
+        self.progress_label = ttk.Label(action_box, text="Aguardando...")
+        self.progress_label.pack(anchor="w", pady=(6, 0))
+
+        summary_box = ttk.LabelFrame(right_frame, text="Resumo", padding=10)
+        summary_box.grid(row=0, column=0, sticky="ew")
+
+        summary_grid = ttk.Frame(summary_box)
+        summary_grid.pack(fill="x")
+
+        self._summary_item(summary_grid, "Processados", self.processed_count_var, 0, 0)
+        self._summary_item(summary_grid, "Sucesso", self.success_count_var, 0, 1)
+        self._summary_item(summary_grid, "Falhas", self.failed_count_var, 1, 0)
+        self._summary_item(summary_grid, "Pulados", self.skipped_count_var, 1, 1)
+        self._summary_item(summary_grid, "Total antes", self.total_before_var, 2, 0)
+        self._summary_item(summary_grid, "Total depois", self.total_after_var, 2, 1)
+
+        results_box = ttk.LabelFrame(right_frame, text="Resultados", padding=10)
+        results_box.grid(row=1, column=0, sticky="nsew", pady=(12, 0))
+        results_box.grid_rowconfigure(0, weight=1)
+        results_box.grid_columnconfigure(0, weight=1)
+
+        columns = ("status", "preset", "source", "output", "message")
+        self.results_tree = ttk.Treeview(results_box, columns=columns, show="headings")
+
+        self.results_tree.heading("status", text="Status")
+        self.results_tree.heading("preset", text="Preset")
+        self.results_tree.heading("source", text="Arquivo de origem")
+        self.results_tree.heading("output", text="Arquivo de saída")
+        self.results_tree.heading("message", text="Mensagem")
+
+        self.results_tree.column("status", width=90, anchor="center")
+        self.results_tree.column("preset", width=90, anchor="center")
+        self.results_tree.column("source", width=260, anchor="w")
+        self.results_tree.column("output", width=260, anchor="w")
+        self.results_tree.column("message", width=300, anchor="w")
+
+        tree_scroll_y = ttk.Scrollbar(results_box, orient="vertical", command=self.results_tree.yview)
+        tree_scroll_x = ttk.Scrollbar(results_box, orient="horizontal", command=self.results_tree.xview)
+        self.results_tree.configure(yscrollcommand=tree_scroll_y.set, xscrollcommand=tree_scroll_x.set)
+
+        self.results_tree.grid(row=0, column=0, sticky="nsew")
+        tree_scroll_y.grid(row=0, column=1, sticky="ns")
+        tree_scroll_x.grid(row=1, column=0, sticky="ew")
+
+        log_box = ttk.LabelFrame(right_frame, text="Log", padding=10)
+        log_box.grid(row=2, column=0, sticky="nsew", pady=(12, 0))
+        log_box.grid_rowconfigure(0, weight=1)
+        log_box.grid_columnconfigure(0, weight=1)
+
+        self.log_text = tk.Text(log_box, wrap="word", font=("Consolas", 10))
+        self.log_text.grid(row=0, column=0, sticky="nsew")
+        self.log_text.configure(state="disabled")
+
+        log_scroll = ttk.Scrollbar(log_box, orient="vertical", command=self.log_text.yview)
+        log_scroll.grid(row=0, column=1, sticky="ns")
+        self.log_text.configure(yscrollcommand=log_scroll.set)
+
+        self.toggle_preset_mode()
+
+    def _summary_item(
+        self,
+        parent: ttk.Frame,
+        label_text: str,
+        variable: tk.StringVar,
+        row: int,
+        column: int,
+    ) -> None:
+        box = ttk.Frame(parent, padding=6)
+        box.grid(row=row, column=column, sticky="ew", padx=4, pady=4)
+        parent.grid_columnconfigure(column, weight=1)
+
+        ttk.Label(box, text=label_text, font=("Segoe UI", 10, "bold")).pack(anchor="w")
+        ttk.Label(box, textvariable=variable, font=("Segoe UI", 12)).pack(anchor="w")
+
+    def toggle_preset_mode(self) -> None:
+        state = "disabled" if self.generate_all_presets_var.get() else "readonly"
+        self.preset_combo.configure(state=state)
+
+    def add_folder(self) -> None:
+        selected = filedialog.askdirectory(title="Selecione uma pasta")
+        if selected:
+            path = Path(selected)
+            if path not in self.selected_folders:
+                self.selected_folders.append(path)
+                self.folder_listbox.insert(tk.END, str(path))
+
+    def add_multiple_folders(self) -> None:
+        while True:
+            selected = filedialog.askdirectory(title="Selecione uma pasta (Cancelar para encerrar)")
+            if not selected:
+                break
+
+            path = Path(selected)
+            if path not in self.selected_folders:
+                self.selected_folders.append(path)
+                self.folder_listbox.insert(tk.END, str(path))
+
+    def remove_selected_folders(self) -> None:
+        selected_indices = list(self.folder_listbox.curselection())
+        if not selected_indices:
+            return
+
+        for index in reversed(selected_indices):
+            self.folder_listbox.delete(index)
+            del self.selected_folders[index]
+
+    def clear_folders(self) -> None:
+        self.folder_listbox.delete(0, tk.END)
+        self.selected_folders.clear()
+
+    def append_log(self, message: str) -> None:
+        self.log_text.configure(state="normal")
+        self.log_text.insert(tk.END, message + "\n")
+        self.log_text.see(tk.END)
+        self.log_text.configure(state="disabled")
+
+    def clear_results_ui(self) -> None:
+        for item in self.results_tree.get_children():
+            self.results_tree.delete(item)
+
+        self.log_text.configure(state="normal")
+        self.log_text.delete("1.0", tk.END)
+        self.log_text.configure(state="disabled")
+
+        self.results.clear()
+        self.success_count_var.set("0")
+        self.failed_count_var.set("0")
+        self.skipped_count_var.set("0")
+        self.processed_count_var.set("0")
+        self.total_before_var.set("0 B")
+        self.total_after_var.set("0 B")
+        self.progress["value"] = 0
+        self.progress_label.configure(text="Aguardando...")
+
+    def start_conversion(self) -> None:
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("Processando", "A conversão já está em andamento.")
+            return
+
+        if not self.selected_folders:
+            messagebox.showwarning("Sem pastas", "Selecione pelo menos uma pasta.")
+            return
+
+        self.clear_results_ui()
+        self.start_button.configure(state="disabled")
+
+        output_root = self.get_output_root()
+        output_root.mkdir(parents=True, exist_ok=True)
+        self.output_path_var.set(str(output_root))
+
+        selected_presets = (
+            list(PRESETS.keys())
+            if self.generate_all_presets_var.get()
+            else [self.selected_preset_var.get()]
+        )
+
+        self.worker_thread = threading.Thread(
+            target=self.run_conversion_worker,
+            args=(
+                self.selected_folders.copy(),
+                output_root,
+                selected_presets,
+                self.skip_if_larger_var.get(),
+                self.keep_existing_var.get(),
+                int(self.method_var.get()),
+            ),
+            daemon=True,
+        )
+        self.worker_thread.start()
+
+    def open_output_folder(self) -> None:
+        output_root = self.get_output_root()
+        output_root.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import os
+            import subprocess
+            import sys
+
+            if sys.platform.startswith("win"):
+                os.startfile(output_root)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.run(["open", str(output_root)], check=False)
+            else:
+                subprocess.run(["xdg-open", str(output_root)], check=False)
+        except Exception as exc:
+            messagebox.showerror("Erro", f"Não foi possível abrir a pasta:\n{exc}")
+
+    def run_conversion_worker(
+        self,
+        folders: list[Path],
+        output_root: Path,
+        presets: list[str],
+        skip_if_larger: bool,
+        keep_existing: bool,
+        method: int,
+    ) -> None:
+        try:
+            all_jobs: list[tuple[Path, Path, str]] = []
+
+            for folder in folders:
+                for image_file in iter_image_files(folder):
+                    for preset_name in presets:
+                        all_jobs.append((folder, image_file, preset_name))
+
+            total_jobs = len(all_jobs)
+            self.ui_queue.put(("progress_max", total_jobs))
+
+            if total_jobs == 0:
+                self.ui_queue.put(("log", "Nenhuma imagem compatível foi encontrada nas pastas selecionadas."))
+                self.ui_queue.put(("done", output_root))
+                return
+
+            total_before = 0
+            total_after = 0
+            processed = 0
+            success = 0
+            failed = 0
+            skipped = 0
+
+            self.ui_queue.put(("log", f"Iniciando conversão de {total_jobs} item(ns)..."))
+
+            for source_root, source_file, preset_name in all_jobs:
+                config = PRESETS[preset_name]
+                source_folder_name = sanitize_folder_name(source_root.name)
+                output_file = build_output_path(
+                    source_root=source_root,
+                    source_file=source_file,
+                    output_root=output_root,
+                    source_folder_name=source_folder_name,
+                    preset_name=preset_name,
+                )
+
+                try:
+                    original_size = source_file.stat().st_size
+                    total_before += original_size
+
+                    if keep_existing and output_file.exists():
+                        converted_size = output_file.stat().st_size
+                        total_after += converted_size
+                        processed += 1
+                        skipped += 1
+
+                        result = ConversionResult(
+                            status="SKIPPED",
+                            source_file=str(source_file),
+                            output_file=str(output_file),
+                            preset=preset_name,
+                            original_size=original_size,
+                            converted_size=converted_size,
+                            message="Arquivo já existia",
+                        )
+                        self.ui_queue.put(("result", result))
+                        self.ui_queue.put(("progress_step", processed))
+                        continue
+
+                    ensure_parent_dir(output_file)
+
+                    with Image.open(source_file) as image:
+                        image = fix_orientation(image)
+                        image = resize_keep_ratio(image, config["width"])
+                        image = convert_mode_for_webp(image)
+
+                        image.save(
+                            output_file,
+                            format="WEBP",
+                            quality=config["quality"],
+                            method=method,
+                            optimize=True,
+                        )
+
+                    converted_size = output_file.stat().st_size
+
+                    if skip_if_larger and converted_size >= original_size:
+                        output_file.unlink(missing_ok=True)
+                        total_after += original_size
+                        processed += 1
+                        skipped += 1
+
+                        result = ConversionResult(
+                            status="SKIPPED",
+                            source_file=str(source_file),
+                            output_file="",
+                            preset=preset_name,
+                            original_size=original_size,
+                            converted_size=converted_size,
+                            message="WebP ficou maior que o original",
+                        )
+                        self.ui_queue.put(("result", result))
+                        self.ui_queue.put(("progress_step", processed))
+                        continue
+
+                    total_after += converted_size
+                    processed += 1
+                    success += 1
+
+                    result = ConversionResult(
+                        status="SUCCESS",
+                        source_file=str(source_file),
+                        output_file=str(output_file),
+                        preset=preset_name,
+                        original_size=original_size,
+                        converted_size=converted_size,
+                        message=(
+                            f"{format_bytes(original_size)} -> "
+                            f"{format_bytes(converted_size)}"
+                        ),
+                    )
+                    self.ui_queue.put(("result", result))
+                    self.ui_queue.put(("progress_step", processed))
+
+                except Exception as exc:
+                    processed += 1
+                    failed += 1
+
+                    result = ConversionResult(
+                        status="FAILED",
+                        source_file=str(source_file),
+                        output_file=str(output_file),
+                        preset=preset_name,
+                        original_size=0,
+                        converted_size=0,
+                        message=str(exc),
+                    )
+                    self.ui_queue.put(("result", result))
+                    self.ui_queue.put(("log", f"Erro em {source_file}: {exc}"))
+                    self.ui_queue.put(("progress_step", processed))
+
+            self.ui_queue.put(
+                (
+                    "summary",
+                    {
+                        "processed": processed,
+                        "success": success,
+                        "failed": failed,
+                        "skipped": skipped,
+                        "before": total_before,
+                        "after": total_after,
+                    },
+                )
+            )
+
+            report_path = save_report_csv(output_root, self.results)
+            self.ui_queue.put(("log", f"Relatório CSV salvo em: {report_path}"))
+            self.ui_queue.put(("done", output_root))
+
+        except Exception:
+            self.ui_queue.put(("log", traceback.format_exc()))
+            self.ui_queue.put(("done", output_root))
+
+    def _poll_queue(self) -> None:
+        try:
+            while True:
+                event = self.ui_queue.get_nowait()
+                event_type = event[0]
+
+                if event_type == "log":
+                    self.append_log(event[1])
+
+                elif event_type == "progress_max":
+                    total = event[1]
+                    self.progress["maximum"] = max(total, 1)
+                    self.progress["value"] = 0
+                    self.progress_label.configure(text=f"0 / {total}")
+
+                elif event_type == "progress_step":
+                    current = event[1]
+                    self.progress["value"] = current
+                    total = int(self.progress["maximum"])
+                    self.progress_label.configure(text=f"{current} / {total}")
+
+                elif event_type == "result":
+                    result: ConversionResult = event[1]
+                    self.results.append(result)
+
+                    self.results_tree.insert(
+                        "",
+                        tk.END,
+                        values=(
+                            result.status,
+                            result.preset,
+                            result.source_file,
+                            result.output_file,
+                            result.message,
+                        ),
+                    )
+
+                elif event_type == "summary":
+                    data = event[1]
+                    self.processed_count_var.set(str(data["processed"]))
+                    self.success_count_var.set(str(data["success"]))
+                    self.failed_count_var.set(str(data["failed"]))
+                    self.skipped_count_var.set(str(data["skipped"]))
+                    self.total_before_var.set(format_bytes(data["before"]))
+                    self.total_after_var.set(format_bytes(data["after"]))
+
+                    self.append_log(
+                        "Resumo: "
+                        f"processados={data['processed']}, "
+                        f"sucesso={data['success']}, "
+                        f"falhas={data['failed']}, "
+                        f"pulados={data['skipped']}, "
+                        f"antes={format_bytes(data['before'])}, "
+                        f"depois={format_bytes(data['after'])}"
+                    )
+
+                elif event_type == "done":
+                    self.start_button.configure(state="normal")
+                    self.append_log("Conversão finalizada.")
+
+        except queue.Empty:
+            pass
+
+        self.root.after(120, self._poll_queue)
+
+
+def main() -> None:
+    root = tk.Tk()
+
+    try:
+        style = ttk.Style(root)
+        if "clam" in style.theme_names():
+            style.theme_use("clam")
+    except Exception:
+        pass
+
+    ImageConverterApp(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
