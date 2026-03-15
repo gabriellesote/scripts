@@ -1,0 +1,11 @@
+sempre que eu quiser usar o upador de img para o supabase, rodar:
+
+cd ~/Área\ de\ trabalho/scripts
+source venv/bin/activate
+python image_webp_optimizer_gui.py
+python supabase_folder_uploader.py
+
+
+supabase keys:
+imgs - otimizadas - webp
+https://errqaoilncyfxjoxfwno.supabase.co
